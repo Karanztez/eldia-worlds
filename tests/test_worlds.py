@@ -88,3 +88,15 @@ def test_chunk_overlap_and_generated_chunk_store(tmp_path: Path) -> None:
     assert reloaded.is_generated("void_zone", cx, cz)
     reloaded.remove_world("void_zone")
     assert not reloaded.is_generated("void_zone", cx, cz)
+
+
+def test_create_native_custom_dimension_uses_zero_origin(tmp_path: Path) -> None:
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    custom = registry.create("sky_dim", world_type="void", use_custom_dimension=True)
+
+    assert custom.custom_dimension is True
+    assert custom.dimension == "sky_dim"
+    assert (custom.center_x, custom.center_z) == (0, 0)
+    assert (custom.spawn_x, custom.spawn_y, custom.spawn_z) == (0.5, 64.0, 0.5)
+    assert registry.find_world_for_chunk("sky_dim", 0, 0) is None

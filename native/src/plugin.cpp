@@ -1,5 +1,7 @@
 #include <endstone/command/command.h>
 #include <endstone/command/command_sender.h>
+#include <endstone/level/dimension.h>
+#include <endstone/level/level.h>
 #include <endstone/plugin/plugin.h>
 
 #include <cstdint>
@@ -93,6 +95,46 @@ public:
             return true;
         }
 
+        if (sub == "create") {
+            if (args.size() < 2) {
+                sender.sendMessage("Usage: /nativeworld create <name> [void|flat|normal]");
+                return true;
+            }
+            const std::string &dim_name = args[1];
+            const std::string world_type = args.size() >= 3 ? args[2] : "void";
+            const auto res = hook_manager_.create_custom_dimension(
+                getServer().getLevel(),
+                dim_name,
+                world_type
+            );
+            if (res.success) {
+                getLogger().info(res.message);
+                sender.sendMessage("[OK] " + res.message);
+            } else {
+                getLogger().warning(res.message);
+                sender.sendMessage("[ERROR] " + res.message);
+            }
+            return true;
+        }
+
+        if (sub == "list") {
+            auto *level = getServer().getLevel();
+            if (level == nullptr) {
+                sender.sendMessage("Server level is not loaded.");
+                return true;
+            }
+            sender.sendMessage("=== Native Level Dimensions ===");
+            for (auto *dim : level->getDimensions()) {
+                if (dim == nullptr) {
+                    continue;
+                }
+                sender.sendMessage(
+                    " - " + dim->getName() + " (type=" + std::to_string(static_cast<int>(dim->getType())) + ")"
+                );
+            }
+            return true;
+        }
+
         if (sub == "probe" && args.size() >= 2) {
             const auto &mod = hook_manager_.module_region();
             if (!mod.has_value()) {
@@ -106,7 +148,7 @@ public:
             return true;
         }
 
-        sender.sendMessage("Usage: /nativeworld <status|scan|probe <rva_hex>>");
+        sender.sendMessage("Usage: /nativeworld <status|scan|list|create|probe> [arg1] [arg2]");
         return true;
     }
 
@@ -114,15 +156,15 @@ private:
     eldia::native::DimensionHookManager hook_manager_;
 };
 
-ENDSTONE_PLUGIN("eldia_worlds_native", "0.1.1", EldiaWorldsNativePlugin) {
-    description = "Native C++ DimensionManager scanner and hook bridge for Endstone";
+ENDSTONE_PLUGIN("eldia_worlds_native", "0.2.0", EldiaWorldsNativePlugin) {
+    description = "Native C++ DimensionManager custom dimension creator for Endstone";
     authors = {"Eldia"};
 
     command("nativeworld")
-        .description("Inspect native bedrock_server DimensionManager hooks")
+        .description("Create and inspect native bedrock_server CustomDimensions")
         .usages(
             "/nativeworld",
-            "/nativeworld [status|scan|probe] [rva_hex: str]"
+            "/nativeworld [status|scan|list|create|probe] [arg1: str] [arg2: str]"
         )
         .permissions("eldia_worlds_native.command.nativeworld");
 

@@ -90,7 +90,45 @@ class WorldsPlugin(Plugin):
         self._tick_counter = 0
         self.register_events(self)
         self.server.scheduler.run_task(self, self._process_chunk_queue, delay=1, period=1)
+        self.server.scheduler.run_task(self, self._sync_native_dimensions, delay=1)
         self.logger.info(f"Loaded {len(self.registry.worlds)} world(s) from {self.registry.storage_path}")
+
+    def _has_native_plugin(self) -> bool:
+        return self.server.plugin_manager.get_plugin("eldia_worlds_native") is not None
+
+    def _register_native_dimension(self, dim_name: str, world_type: str) -> bool:
+        if not self._has_native_plugin():
+            return False
+        self.server.dispatch_command(
+            self.server.command_sender,
+            f"nativeworld create {dim_name} {world_type}",
+        )
+        return self._resolve_dimension(dim_name) is not None
+
+    def _sync_native_dimensions(self) -> None:
+        if not self._has_native_plugin():
+            return
+        changed = False
+        for world in self.registry.list_worlds():
+            if world.builtin:
+                continue
+            if not world.custom_dimension and (abs(world.center_x) >= 100_000 or abs(world.center_z) >= 100_000):
+                # Upgrade legacy far-coordinate worlds to true native CustomDimensions
+                if self._register_native_dimension(world.name, world.world_type):
+                    world.dimension = world.name
+                    world.center_x = 0
+                    world.center_z = 0
+                    world.spawn_x = 0.5
+                    world.spawn_y = 64.0
+                    world.spawn_z = 0.5
+                    world.custom_dimension = True
+                    world.generated = False
+                    changed = True
+                    self.logger.info(f"Upgraded world '{world.name}' to native CustomDimension at (0.5, 64.0, 0.5)")
+            elif world.custom_dimension:
+                self._register_native_dimension(world.dimension, world.world_type)
+        if changed:
+            self.registry.save()
 
     def on_disable(self) -> None:
         self.chunk_store.save()
@@ -196,11 +234,14 @@ class WorldsPlugin(Plugin):
                 dimension = VALID_DIMENSIONS[int(values[2])]
                 radius_text = str(values[3]).strip()
                 radius = int(radius_text) if radius_text else DEFAULT_BORDER_RADIUS
+                key = normalize_world_name(name)
+                use_custom = self._register_native_dimension(key, world_type)
                 world = self.registry.create(
                     name=name,
                     world_type=world_type,
                     dimension=dimension,
                     border_radius=radius,
+                    use_custom_dimension=use_custom,
                 )
                 p.send_message(
                     f"{ColorFormat.GREEN}Created world '{world.name}' "
@@ -371,11 +412,14 @@ class WorldsPlugin(Plugin):
             return True
 
         try:
+            key = normalize_world_name(name)
+            use_custom = self._register_native_dimension(key, world_type)
             world = self.registry.create(
                 name=name,
                 world_type=world_type,
                 dimension=dimension,
                 border_radius=radius,
+                use_custom_dimension=use_custom,
             )
         except ValueError as exc:
             sender.send_message(f"{ColorFormat.RED}{exc}")

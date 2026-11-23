@@ -48,6 +48,7 @@ class VirtualWorld:
     gamemode: str | None = None
     generated: bool = False
     builtin: bool = False
+    custom_dimension: bool = False
 
     def contains(self, dimension_name: str, x: float, z: float) -> bool:
         """Check whether (dimension_name, x, z) falls inside this world's border."""
@@ -196,8 +197,9 @@ class WorldRegistry:
         dimension: str = "overworld",
         border_radius: int = DEFAULT_BORDER_RADIUS,
         gamemode: str | None = None,
+        use_custom_dimension: bool = False,
     ) -> VirtualWorld:
-        """Create and persist a new virtual world."""
+        """Create and persist a new virtual or native custom-dimension world."""
         key = normalize_world_name(name)
         if not is_valid_world_name(key):
             raise ValueError("World name must be 1-32 characters of letters, numbers, '_' or '-'.")
@@ -205,24 +207,30 @@ class WorldRegistry:
             raise ValueError(f"World '{key}' already exists.")
         if world_type not in VALID_WORLD_TYPES:
             raise ValueError(f"Invalid world type '{world_type}'. Expected: {', '.join(VALID_WORLD_TYPES)}.")
-        if dimension not in VALID_DIMENSIONS:
+        if not use_custom_dimension and dimension not in VALID_DIMENSIONS:
             raise ValueError(f"Invalid dimension '{dimension}'. Expected: {', '.join(VALID_DIMENSIONS)}.")
         if border_radius < 0:
             raise ValueError("Border radius must be 0 (unlimited) or a positive integer.")
         if gamemode is not None and gamemode not in VALID_GAMEMODES:
             raise ValueError(f"Invalid gamemode '{gamemode}'. Expected: {', '.join(VALID_GAMEMODES)}.")
 
-        center_x, center_z = self._next_center(dimension)
-        if world_type == "void":
-            spawn_y = 200.0
-        elif world_type == "flat":
+        if use_custom_dimension:
+            target_dim = key
+            center_x, center_z = 0, 0
             spawn_y = 64.0
         else:
-            spawn_y = 100.0
+            target_dim = dimension
+            center_x, center_z = self._next_center(dimension)
+            if world_type == "void":
+                spawn_y = 200.0
+            elif world_type == "flat":
+                spawn_y = 64.0
+            else:
+                spawn_y = 100.0
 
         world = VirtualWorld(
             name=key,
-            dimension=dimension,
+            dimension=target_dim,
             world_type=world_type,
             center_x=center_x,
             center_z=center_z,
@@ -231,8 +239,9 @@ class WorldRegistry:
             spawn_z=float(center_z) + 0.5,
             border_radius=border_radius,
             gamemode=gamemode,
-            generated=(world_type == "normal"),
+            generated=(world_type == "normal" and not use_custom_dimension),
             builtin=False,
+            custom_dimension=use_custom_dimension,
         )
         self.worlds[key] = world
         self.save()
@@ -260,10 +269,11 @@ class WorldRegistry:
     def find_world_for_chunk(
         self, dimension_name: str, chunk_x: int, chunk_z: int
     ) -> VirtualWorld | None:
-        """Find a custom void/flat world whose zone overlaps the given chunk."""
+        """Find a custom void/flat fallback world whose zone overlaps the given chunk."""
         for world in self.worlds.values():
             if (
                 not world.builtin
+                and not world.custom_dimension
                 and world.world_type in ("void", "flat")
                 and world.chunk_overlaps(dimension_name, chunk_x, chunk_z)
             ):
