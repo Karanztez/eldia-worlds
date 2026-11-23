@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-eldia-worlds"
-version = "0.2.0"
-description = "Virtual multi-world and dimension manager plugin for Endstone"
+version = "0.2.1"
+description = "Virtual multi-world and dimension manager plugin and API package for Endstone"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = ["endstone>=0.11"]

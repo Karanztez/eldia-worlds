@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from eldia_worlds import WorldsAPI, get_worlds_api
 from eldia_worlds.storage import DEFAULT_SPACING, GeneratedChunkStore, WorldRegistry
 
 
@@ -100,3 +101,24 @@ def test_create_native_custom_dimension_uses_zero_origin(tmp_path: Path) -> None
     assert (custom.center_x, custom.center_z) == (0, 0)
     assert (custom.spawn_x, custom.spawn_y, custom.spawn_z) == (0.5, 64.0, 0.5)
     assert registry.find_world_for_chunk("sky_dim", 0, 0) is None
+
+
+def test_worlds_api_package_interface(tmp_path: Path) -> None:
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    lobby = registry.create("lobby_hub", world_type="flat", dimension="overworld", border_radius=300)
+
+    api = WorldsAPI(registry=registry)
+    WorldsAPI.set_instance(api)
+    try:
+        resolved = get_worlds_api()
+        assert resolved is api
+        assert resolved.get_world("lobby_hub") is lobby
+        assert resolved.detect_world_name("overworld", lobby.center_x + 10, lobby.center_z - 10) == "lobby_hub"
+
+        updated = resolved.set_world_spawn("lobby_hub", 15.0, 80.0, -25.0, yaw=90.0, pitch=5.0)
+        assert updated is not None
+        assert (updated.spawn_x, updated.spawn_y, updated.spawn_z) == (15.0, 80.0, -25.0)
+        assert updated.spawn_yaw == 90.0
+    finally:
+        WorldsAPI.set_instance(None)

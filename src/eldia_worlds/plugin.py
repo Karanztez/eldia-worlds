@@ -11,6 +11,7 @@ from endstone.form import ActionForm, Dropdown, ModalForm, TextInput
 from endstone.level import Dimension, Location
 from endstone.plugin import Plugin
 
+from .api import WorldsAPI
 from .generator import apply_chunk_template, build_spawn_area, resolve_safe_spawn_y
 from .storage import (
     DEFAULT_BORDER_RADIUS,
@@ -83,6 +84,8 @@ class WorldsPlugin(Plugin):
     def on_enable(self) -> None:
         self.registry = WorldRegistry(self.data_folder / "worlds.json")
         self.registry.load()
+        self.api = WorldsAPI(self, registry=self.registry, server_getter=lambda: self.server)
+        WorldsAPI.set_instance(self.api)
         self.chunk_store = GeneratedChunkStore(self.data_folder / "generated_chunks.json")
         self.chunk_store.load()
         self._chunk_queue: deque[tuple[str, int, int]] = deque()
@@ -131,6 +134,7 @@ class WorldsPlugin(Plugin):
             self.registry.save()
 
     def on_disable(self) -> None:
+        WorldsAPI.set_instance(None)
         self.chunk_store.save()
 
     def _resolve_dimension(self, dimension_key: str) -> Dimension | None:

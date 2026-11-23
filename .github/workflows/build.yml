@@ -9,6 +9,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   python-wheel:
@@ -26,13 +27,15 @@ jobs:
         run: |
           ruff check src tests tools
           pytest -v
-      - name: Build Python wheel
+      - name: Build Python wheel and sdist
         run: |
-          python -m build --wheel --outdir dist-artifacts
+          python -m build --outdir dist-artifacts
       - uses: actions/upload-artifact@v4
         with:
           name: eldia-worlds-python-wheel
-          path: dist-artifacts/*.whl
+          path: |
+            dist-artifacts/*.whl
+            dist-artifacts/*.tar.gz
 
   native-linux:
     runs-on: ubuntu-22.04
@@ -90,6 +93,32 @@ jobs:
           name: eldia-worlds-native-windows-dll
           path: dist-native-win/*.dll
 
+  github-package:
+    needs: [python-wheel, native-linux, native-windows]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: pkg-assets
+          merge-multiple: true
+      - name: Publish package to GitHub Packages (GHCR)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          TAG_NAME="${GITHUB_REF_NAME:-latest}"
+          cat <<EOF > Dockerfile.pkg
+          FROM scratch
+          LABEL org.opencontainers.image.source="https://github.com/${{ github.repository }}"
+          LABEL org.opencontainers.image.description="endstone-eldia-worlds Python API wheel and native plugin package"
+          COPY pkg-assets/ /
+          EOF
+          echo "${GH_TOKEN}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker build -f Dockerfile.pkg -t "ghcr.io/${OWNER_LC}/endstone-eldia-worlds:${TAG_NAME}" -t "ghcr.io/${OWNER_LC}/endstone-eldia-worlds:latest" .
+          docker push "ghcr.io/${OWNER_LC}/endstone-eldia-worlds:${TAG_NAME}"
+          docker push "ghcr.io/${OWNER_LC}/endstone-eldia-worlds:latest"
+
   release:
     needs: [python-wheel, native-linux, native-windows]
     if: startsWith(github.ref, 'refs/tags/v')
@@ -105,5 +134,6 @@ jobs:
           generate_release_notes: true
           files: |
             release-assets/*.whl
+            release-assets/*.tar.gz
             release-assets/*.so
             release-assets/*.dll

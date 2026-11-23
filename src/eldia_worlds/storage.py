@@ -266,6 +266,31 @@ class WorldRegistry:
                 return world
         return None
 
+    def set_spawn(
+        self,
+        name: str,
+        x: float,
+        y: float,
+        z: float,
+        yaw: float = 0.0,
+        pitch: float = 0.0,
+        *,
+        dimension: str | None = None,
+    ) -> VirtualWorld | None:
+        """Update and persist the spawn location for an existing world."""
+        world = self.get(name)
+        if world is None:
+            return None
+        if dimension:
+            world.dimension = normalize_world_name(dimension)
+        world.spawn_x = float(x)
+        world.spawn_y = float(y)
+        world.spawn_z = float(z)
+        world.spawn_yaw = float(yaw)
+        world.spawn_pitch = float(pitch)
+        self.save()
+        return world
+
     def find_world_for_chunk(
         self, dimension_name: str, chunk_x: int, chunk_z: int
     ) -> VirtualWorld | None:
