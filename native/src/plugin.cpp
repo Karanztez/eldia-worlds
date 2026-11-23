@@ -114,13 +114,16 @@ private:
     eldia::native::DimensionHookManager hook_manager_;
 };
 
-ENDSTONE_PLUGIN("eldia_worlds_native", "0.1.0", EldiaWorldsNativePlugin) {
+ENDSTONE_PLUGIN("eldia_worlds_native", "0.1.1", EldiaWorldsNativePlugin) {
     description = "Native C++ DimensionManager scanner and hook bridge for Endstone";
     authors = {"Eldia"};
 
     command("nativeworld")
         .description("Inspect native bedrock_server DimensionManager hooks")
-        .usages("/nativeworld [status|scan|probe <rva_hex>]")
+        .usages(
+            "/nativeworld",
+            "/nativeworld [status|scan|probe] [rva_hex: str]"
+        )
         .permissions("eldia_worlds_native.command.nativeworld");
 
     permission("eldia_worlds_native.command.nativeworld")

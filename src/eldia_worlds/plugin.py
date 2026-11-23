@@ -1,7 +1,5 @@
 """Endstone plugin entry point for virtual multi-world and dimension management."""
 
-from __future__ import annotations
-
 import json
 from collections import deque
 from typing import Any, ClassVar
