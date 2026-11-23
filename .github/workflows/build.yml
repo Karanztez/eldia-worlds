@@ -24,7 +24,7 @@ jobs:
           pip install -e . --no-deps
       - name: Lint and test
         run: |
-          ruff check src tests
+          ruff check src tests tools
           pytest -v
       - name: Build Python wheel
         run: |
