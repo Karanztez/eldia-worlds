@@ -32,13 +32,23 @@ jobs:
           path: dist-artifacts/*.whl
 
   native-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install build dependencies
+      - name: Set up Clang 18
+        env:
+          LLVM_VERSION: 18
         run: |
-          sudo apt-get update
-          sudo apt-get install -y clang libc++-dev libc++abi-dev cmake ninja-build git
+          sudo apt-get update -y -q
+          sudo apt-get install -y -q lsb-release wget software-properties-common gnupg
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh ${LLVM_VERSION}
+          sudo apt-get install -y -q libc++-${LLVM_VERSION}-dev libc++abi-${LLVM_VERSION}-dev
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-${LLVM_VERSION} 200
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-${LLVM_VERSION} 200
+      - name: Set up CMake and Ninja
+        uses: lukka/get-cmake@latest
       - name: Configure and build (.so)
         env:
           CC: clang
