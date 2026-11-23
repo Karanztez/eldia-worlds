@@ -1,33 +1,19 @@
-# eldia-worlds-native
+# eldia_worlds_native (C++ Native Plugin)
 
-Native C++ Endstone plugin scaffold for runtime signature scanning and `DimensionManager` hooking on Bedrock Dedicated Server (`bedrock_server.exe` / `bedrock_server`).
+Native C++ Endstone plugin that unlocks runtime `CustomDimension` (`Dimension.Type.CUSTOM = 999`) creation on Minecraft Bedrock Dedicated Server (`1.26.60+`).
 
-## Discovered Targets (`bedrock_server.exe`)
+## Reverse-Engineered Internals (Linux ELF64 `bedrock_server`)
 
-- `ServerLevel.cpp` `LEA` xref: `RVA 0x009505dd`
-- `DimensionManager::_registerCustomDimensionWithFactory` lambda RTTI: `TD_RVA 0x0d32ad30`
-- `DimensionManager::serverInitialize` lambda RTTI: `TD_RVA 0x0d32aca0`
-- `ScriptCustomDimensionManager::registerCustomDimension` string: `RVA 0x0b117ca8`
+- **`DimensionManager::registerCustomDimension`**:
+  - Signature: `55 41 57 41 56 41 54 53 49 89 CC 48 89 D3 49 89 F6 49 89 FF 48 8B 7F 08 E8`
+  - Allocates or retrieves the persisted `DimensionType` ID in `LevelStorage`, registers a 64-byte `DimensionDefinitionGroup::DimensionDefinition` (`generator_type = 5` for `VoidGenerator`, `2` for `FlatWorldGenerator`, `1` for `OverworldGenerator`), and registers the `CustomDimension` factory lambda via `DimensionManager::_registerCustomDimensionWithFactory`.
+- **`ServerLevel` Vtable Resolution**:
+  - Dynamically scans `ServerLevel`'s vtable for `getDimensionManager` (`48 8B 87 ? ? 00 00 48 8B 40 18 C3`) and `getOrCreateDimension` (`48 8B 86 ? ? 00 00 48 8B 70 18 E9`).
+  - Calling `getOrCreateDimension` triggers `DimensionManager::getOnNewDimensionCreatedConnector()`, which `EndstoneLevel` listens to and wraps into `server.level.dimensions`.
 
-## Build (Windows x64 with MSVC + Ninja)
-
-```bat
-call "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
-```
-
-## Build (Linux x86_64 for Debian VPS)
+## Build on Linux (Clang 18 + `libc++`)
 
 ```bash
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+CC=clang-18 CXX=clang++-18 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
-
-Copy the resulting `.dll` (Windows) or `.so` (Linux) into `bedrock_server/plugins/`.
-
-## Commands
-
-- `/nativeworld status` — Show loaded `bedrock_server` base address and hook status
-- `/nativeworld scan` — Run live in-memory byte-signature scan on `bedrock_server`
-- `/nativeworld probe <rva_hex>` — Inspect bytes at a given RVA relative to `bedrock_server` base
