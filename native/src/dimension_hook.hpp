@@ -1,5 +1,6 @@
 #pragma once
 
+#include <endstone/level/dimension.h>
 #include <endstone/level/level.h>
 
 #include <array>
