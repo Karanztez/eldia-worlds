@@ -1,5 +1,9 @@
 # Eldia Worlds (`endstone-eldia-worlds` + `eldia_worlds_native`)
 
+<p align="center">
+  <img src="./assets/logo.jpg" alt="Eldia Worlds Logo" width="380" />
+</p>
+
 Multi-world and native Custom Dimension (`type=999`) plugin suite for [Endstone](https://github.com/EndstoneMC/endstone) on Minecraft Bedrock Dedicated Server (`1.26.60+`).
 
 ## Architecture
