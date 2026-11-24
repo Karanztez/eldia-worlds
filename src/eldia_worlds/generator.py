@@ -19,10 +19,20 @@ _DIMENSION_HEIGHT_RANGES: dict[str, tuple[int, int]] = {
 }
 
 
-def _fill(server: Server, dimension_name: str, x1: int, y1: int, z1: int, x2: int, y2: int, z2: int, block: str) -> None:
+def _fill(
+    server: Server,
+    dimension_name: str,
+    x1: int,
+    y1: int,
+    z1: int,
+    x2: int,
+    y2: int,
+    z2: int,
+    block: str,
+) -> bool:
     """Execute a native BDS /fill command in the target dimension."""
     cmd = f"execute in {dimension_name} run fill {x1} {y1} {z1} {x2} {y2} {z2} {block}"
-    server.dispatch_command(server.command_sender, cmd)
+    return bool(server.dispatch_command(server.command_sender, cmd))
 
 
 def apply_chunk_template(
@@ -151,11 +161,46 @@ def apply_imported_chunk(
             logger.debug(f"Chunk ({chunk_x}, {chunk_z}) for '{world.name}' not writable yet: {exc}")
         return False
 
-    y = min_y
-    while y <= max_y:
-        top = min(y + 127, max_y)
+    # Clear bottom slice first; if /fill fails outside ticking area, bedrock remains non-air.
+    bottom_top = min(min_y + 127, max_y)
+    ok_bottom = _fill(server, world.dimension, x1, min_y, z1, x2, bottom_top, z2, "air")
+    if not ok_bottom:
+        try:
+            bottom_type = str(dimension.get_block_at(x1, min_y, z1).type)
+        except Exception as exc:  # noqa: BLE001
+            if logger is not None and hasattr(logger, "debug"):
+                logger.debug(f"Chunk ({chunk_x}, {chunk_z}) bottom check failed: {exc}")
+            return False
+        if bottom_type != "minecraft:air":
+            if logger is not None and hasattr(logger, "debug"):
+                logger.debug(
+                    f"Chunk ({chunk_x}, {chunk_z}) bottom /fill failed (still {bottom_type}); deferring."
+                )
+            return False
+
+    # Clear middle slices up to y=191 unconditionally when present, then check highest block
+    # before clearing y>=192 to avoid BDS '0 blocks filled' error spam on normal air chunks.
+    y = bottom_top + 1
+    while y <= max_y and y < 192:
+        top = min(y + 127, 191, max_y)
         _fill(server, world.dimension, x1, y, z1, x2, top, z2, "air")
         y = top + 1
+
+    if y <= max_y:
+        max_top = 0
+        try:
+            max_top = max(
+                dimension.get_highest_block_y_at(x1 + dx, z1 + dz)
+                for dx in (0, 7, 15)
+                for dz in (0, 7, 15)
+            )
+        except Exception:  # noqa: BLE001
+            max_top = max_y
+        if max_top >= y:
+            while y <= max_y:
+                top = min(y + 127, max_y)
+                _fill(server, world.dimension, x1, y, z1, x2, top, z2, "air")
+                y = top + 1
 
     data_cache: dict[tuple[str, tuple[tuple[str, object], ...]], object | None] = {}
     create_bd = getattr(server, "create_block_data", None)

@@ -9,8 +9,9 @@ from types import MethodType, SimpleNamespace
 import pytest
 
 from eldia_worlds import WorldsAPI, get_worlds_api
+from eldia_worlds.generator import apply_imported_chunk
 from eldia_worlds.importer import decode_subchunk_blocks
-from eldia_worlds.plugin import WorldsPlugin
+from eldia_worlds.plugin import TICK_BUILD_RADIUS, WorldsPlugin
 from eldia_worlds.storage import DEFAULT_SPACING, GeneratedChunkStore, WorldRegistry
 
 
@@ -193,6 +194,9 @@ def _make_dummy_plugin(tmp_path: Path, registry: WorldRegistry) -> SimpleNamespa
     plugin._defer_chunk = MethodType(WorldsPlugin._defer_chunk, plugin)
     plugin._get_importer = MethodType(WorldsPlugin._get_importer, plugin)
     plugin._enqueue_chunk = MethodType(WorldsPlugin._enqueue_chunk, plugin)
+    plugin._is_within_player_tick_radius = MethodType(
+        WorldsPlugin._is_within_player_tick_radius, plugin
+    )
     return plugin
 
 
@@ -276,11 +280,17 @@ def test_process_chunk_queue_retries_unloaded_and_skips_missing_importer(tmp_pat
         import_source="thailand",
     )
     plugin = _make_dummy_plugin(tmp_path, registry)
+    cx = thailand.center_x // 16
+    cz = thailand.center_z // 16
+    dim_overworld = SimpleNamespace(name="Overworld")
+    plugin.server.online_players = [
+        SimpleNamespace(
+            location=SimpleNamespace(dimension=dim_overworld, x=cx * 16 + 8.0, y=65.0, z=cz * 16 + 8.0)
+        )
+    ]
     loaded_chunks: list[SimpleNamespace] = []
     plugin._resolve_dimension = lambda _key: SimpleNamespace(loaded_chunks=loaded_chunks)
 
-    cx = thailand.center_x // 16
-    cz = thailand.center_z // 16
     plugin._enqueue_chunk(thailand, cx, cz)
 
     # Tick 1: chunk is not in loaded_chunks yet -> must be deferred (not dropped or marked generated)
@@ -294,3 +304,77 @@ def test_process_chunk_queue_retries_unloaded_and_skips_missing_importer(tmp_pat
     WorldsPlugin._process_chunk_queue(plugin)
     assert not plugin.chunk_store.is_generated("thailand", cx, cz)
     assert len(plugin._warnings) == 1
+
+
+def test_chunk_outside_tick_radius_not_marked_and_proximity_scanner_orders_nearest(
+    tmp_path: Path,
+) -> None:
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    thailand = registry.create(
+        "thailand",
+        world_type="imported",
+        dimension="overworld",
+        border_radius=1200,
+        import_source="thailand",
+    )
+    plugin = _make_dummy_plugin(tmp_path, registry)
+    pcx = thailand.center_x // 16
+    pcz = thailand.center_z // 16
+    dim_overworld = SimpleNamespace(name="Overworld")
+    plugin.server.online_players = [
+        SimpleNamespace(
+            location=SimpleNamespace(
+                dimension=dim_overworld, x=pcx * 16 + 4.0, y=65.0, z=pcz * 16 + 4.0
+            )
+        )
+    ]
+    far_cx = pcx + TICK_BUILD_RADIUS + 4
+    far_cz = pcz + TICK_BUILD_RADIUS + 4
+    plugin._resolve_dimension = lambda _key: SimpleNamespace(
+        loaded_chunks=[SimpleNamespace(x=far_cx, z=far_cz)]
+    )
+
+    # Outer chunk queued out of radius must be skipped WITHOUT being marked generated
+    plugin._enqueue_chunk(thailand, far_cx, far_cz)
+    WorldsPlugin._process_chunk_queue(plugin)
+    assert not plugin.chunk_store.is_generated("thailand", far_cx, far_cz)
+    assert len(plugin._chunk_queue) == 0
+
+    # Proximity scanner enqueues (2*R + 1)^2 chunks ordered closest to player first
+    WorldsPlugin._scan_player_nearby_chunks(plugin)
+    side = 2 * TICK_BUILD_RADIUS + 1
+    assert len(plugin._chunk_queue) == side * side
+    first_item = plugin._chunk_queue[0]
+    assert first_item == ("thailand", pcx, pcz)
+
+
+def test_apply_imported_chunk_returns_false_when_bottom_fill_fails(tmp_path: Path) -> None:
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    thailand = registry.create(
+        "thailand",
+        world_type="imported",
+        dimension="overworld",
+        border_radius=1200,
+        import_source="thailand",
+    )
+    cx = thailand.center_x // 16
+    cz = thailand.center_z // 16
+    importer = SimpleNamespace(
+        read_chunk_blocks=lambda _scx, _scz: [(0, 64, 0, "minecraft:stone", {})]
+    )
+    server = SimpleNamespace(
+        command_sender=object(),
+        dispatch_command=lambda _sender, _cmd: False,
+    )
+    dimension = SimpleNamespace(
+        get_block_at=lambda _x, _y, _z: SimpleNamespace(
+            type="minecraft:bedrock",
+            set_type=lambda *_a, **_kw: None,
+        ),
+        get_highest_block_y_at=lambda _x, _z: 64,
+    )
+
+    ok = apply_imported_chunk(server, dimension, thailand, cx, cz, importer)
+    assert ok is False

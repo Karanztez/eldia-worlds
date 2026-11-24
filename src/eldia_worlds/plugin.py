@@ -43,6 +43,9 @@ _GAMEMODE_MAP = {
     "spectator": GameMode.SPECTATOR,
 }
 
+# BDS default tick-distance=4: /fill succeeds reliably within +/-4 chunks of an online player.
+TICK_BUILD_RADIUS = 4
+
 
 class WorldsPlugin(Plugin):
     """Virtual multi-world and dimension manager plugin for Endstone."""
@@ -108,18 +111,19 @@ class WorldsPlugin(Plugin):
         imported_names = self._scan_import_folder()
         if imported_names:
             self.logger.info(f"Auto-imported map(s) into overworld: {', '.join(imported_names)}")
-        # Reset stale chunk_store marks from pre-0.2.6 imported worlds once
+        # Reset stale chunk_store marks from pre-0.2.7 imported worlds once
         healed = False
         for w in self.registry.list_worlds():
-            if w.world_type == "imported" and w.import_version < 3:
+            if w.world_type == "imported" and w.import_version < 4:
                 self.chunk_store.remove_world(w.name)
-                w.import_version = 3
+                w.import_version = 4
                 healed = True
         if healed:
             self.chunk_store.save()
             self.registry.save()
         self.register_events(self)
         self.server.scheduler.run_task(self, self._process_chunk_queue, delay=1, period=1)
+        self.server.scheduler.run_task(self, self._scan_player_nearby_chunks, delay=10, period=10)
         self.server.scheduler.run_task(self, self._sync_native_dimensions, delay=1)
         self.logger.info(f"Loaded {len(self.registry.worlds)} world(s) from {self.registry.storage_path}")
 
@@ -173,7 +177,7 @@ class WorldsPlugin(Plugin):
                 sx, sy, sz = read_level_dat_spawn(world_dir)
                 importer = BedrockWorldImporter(world_dir)
                 bounds = importer.get_chunk_bounds()
-                radius = DEFAULT_BORDER_RADIUS
+                radius = 256
                 if bounds is not None:
                     min_cx, max_cx, min_cz, max_cz = bounds
                     max_block = max(
@@ -182,7 +186,7 @@ class WorldsPlugin(Plugin):
                         abs(min_cz * 16),
                         abs(max_cz * 16 + 15),
                     )
-                    radius = min(45_000, max(DEFAULT_BORDER_RADIUS, max_block + 64))
+                    radius = min(45_000, max(256, max_block + 32))
                 vw = self.registry.create(
                     name=key,
                     world_type="imported",
@@ -272,14 +276,19 @@ class WorldsPlugin(Plugin):
         )
 
     def _enqueue_imported_spawn_chunks(self, world: VirtualWorld) -> None:
-        """Enqueue the 5x5 chunk area around an imported world's spawn once loaded."""
+        """Enqueue the ticking chunk area around an imported world's spawn, closest first."""
         if world.world_type != "imported":
             return
         scx = int(world.spawn_x // 16)
         scz = int(world.spawn_z // 16)
-        for dx in range(-2, 3):
-            for dz in range(-2, 3):
-                self._enqueue_chunk(world, scx + dx, scz + dz)
+        offsets = [
+            (dx, dz)
+            for dx in range(-TICK_BUILD_RADIUS, TICK_BUILD_RADIUS + 1)
+            for dz in range(-TICK_BUILD_RADIUS, TICK_BUILD_RADIUS + 1)
+        ]
+        offsets.sort(key=lambda pair: pair[0] * pair[0] + pair[1] * pair[1])
+        for dx, dz in offsets:
+            self._enqueue_chunk(world, scx + dx, scz + dz)
 
     def _teleport_player(self, player: Player, world: VirtualWorld) -> bool:
         loc = self._world_location(world)
@@ -394,6 +403,50 @@ class WorldsPlugin(Plugin):
         )
         player.send_form(form)
 
+    def _is_within_player_tick_radius(
+        self,
+        dim_key: str,
+        chunk_x: int,
+        chunk_z: int,
+        radius: int = TICK_BUILD_RADIUS,
+    ) -> bool:
+        """Return True if any online player in `dim_key` is within `radius` chunks."""
+        for player in getattr(self.server, "online_players", ()):
+            loc = getattr(player, "location", None)
+            if loc is None or loc.dimension.name.lower() != dim_key:
+                continue
+            pcx = int(loc.x // 16)
+            pcz = int(loc.z // 16)
+            if max(abs(chunk_x - pcx), abs(chunk_z - pcz)) <= radius:
+                return True
+        return False
+
+    def _scan_player_nearby_chunks(self) -> None:
+        """Enqueue ungenerated chunks inside each player's ticking area, closest first."""
+        offsets = sorted(
+            (
+                (dx, dz)
+                for dx in range(-TICK_BUILD_RADIUS, TICK_BUILD_RADIUS + 1)
+                for dz in range(-TICK_BUILD_RADIUS, TICK_BUILD_RADIUS + 1)
+            ),
+            key=lambda pair: pair[0] * pair[0] + pair[1] * pair[1],
+        )
+        for player in getattr(self.server, "online_players", ()):
+            loc = getattr(player, "location", None)
+            if loc is None:
+                continue
+            dim_name = loc.dimension.name.lower()
+            pcx = int(loc.x // 16)
+            pcz = int(loc.z // 16)
+            world = self.registry.find_world_for_chunk(dim_name, pcx, pcz)
+            if world is None:
+                continue
+            for dx, dz in offsets:
+                cx = pcx + dx
+                cz = pcz + dz
+                if world.chunk_overlaps(dim_name, cx, cz):
+                    self._enqueue_chunk(world, cx, cz)
+
     def _enqueue_chunk(self, world: VirtualWorld, chunk_x: int, chunk_z: int) -> None:
         key = (world.name, chunk_x, chunk_z)
         if key in self._queued_keys or self.chunk_store.is_generated(world.name, chunk_x, chunk_z):
@@ -427,6 +480,11 @@ class WorldsPlugin(Plugin):
             if dim is None:
                 continue
             dim_key = world.dimension.lower()
+            if not self._is_within_player_tick_radius(dim_key, chunk_x, chunk_z):
+                # Skip outer non-ticking chunks without marking generated; proximity scan
+                # will enqueue them as soon as a player walks near them.
+                self._chunk_retries.pop(key, None)
+                continue
             if dim_key not in loaded_by_dim:
                 loaded_by_dim[dim_key] = {(c.x, c.z) for c in dim.loaded_chunks}
             if (chunk_x, chunk_z) not in loaded_by_dim[dim_key]:
@@ -486,6 +544,8 @@ class WorldsPlugin(Plugin):
     def on_chunk_load(self, event: ChunkLoadEvent) -> None:
         chunk = event.chunk
         dim_name = chunk.dimension.name.lower()
+        if not self._is_within_player_tick_radius(dim_name, chunk.x, chunk.z):
+            return
         world = self.registry.find_world_for_chunk(dim_name, chunk.x, chunk.z)
         if world is not None:
             self._enqueue_chunk(world, chunk.x, chunk.z)
