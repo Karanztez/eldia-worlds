@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from eldia_worlds import WorldsAPI, get_worlds_api
+from eldia_worlds.importer import decode_subchunk_blocks
 from eldia_worlds.storage import DEFAULT_SPACING, GeneratedChunkStore, WorldRegistry
 
 
@@ -122,3 +123,35 @@ def test_worlds_api_package_interface(tmp_path: Path) -> None:
         assert updated.spawn_yaw == 90.0
     finally:
         WorldsAPI.set_instance(None)
+
+
+def test_imported_world_registration_and_subchunk_decoder(tmp_path: Path) -> None:
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    imported = registry.create(
+        "thailand",
+        world_type="imported",
+        dimension="overworld",
+        border_radius=2000,
+        import_source="thailand",
+    )
+    assert imported.world_type == "imported"
+    assert imported.import_source == "thailand"
+    assert imported.dimension == "overworld"
+    assert imported.generated is True
+    assert registry.find_world_for_chunk("overworld", imported.center_x // 16, imported.center_z // 16) is imported
+
+    # Build a synthetic SubChunk v9 single-block palette (bits_per_block = 0 -> flags = 0)
+    # Root TAG_Compound("") { TAG_String("name") = "minecraft:stone", TAG_End }
+    nbt_entry = (
+        b"\x0a\x00\x00"
+        + b"\x08\x04\x00name"
+        + b"\x0f\x00minecraft:stone"
+        + b"\x00"
+    )
+    # version=9, layers=1, sy=4, flags=0 (0 bits/block)
+    raw_sub = bytes([9, 1, 4, 0]) + nbt_entry
+    blocks = decode_subchunk_blocks(raw_sub, 4)
+    assert len(blocks) == 4096
+    assert blocks[0][1] == 64
+    assert blocks[0][3] == "minecraft:stone"

@@ -12,7 +12,13 @@ from endstone.level import Dimension, Location
 from endstone.plugin import Plugin
 
 from .api import WorldsAPI
-from .generator import apply_chunk_template, build_spawn_area, resolve_safe_spawn_y
+from .generator import (
+    apply_chunk_template,
+    apply_imported_chunk,
+    build_spawn_area,
+    resolve_safe_spawn_y,
+)
+from .importer import BedrockWorldImporter, read_level_dat_spawn, resolve_import_world_dir
 from .storage import (
     DEFAULT_BORDER_RADIUS,
     VALID_DIMENSIONS,
@@ -56,6 +62,7 @@ class WorldsPlugin(Plugin):
                 "/world info <name: str>",
                 "/world tp <name: str> [player: player]",
                 "/world create <name: str> [world_type: str] [dimension: str] [radius: int]",
+                "/world import",
                 "/world setspawn [name: str]",
                 "/world setborder <name: str> <radius: int>",
                 "/world setgamemode <name: str> <mode: str>",
@@ -88,13 +95,79 @@ class WorldsPlugin(Plugin):
         WorldsAPI.set_instance(self.api)
         self.chunk_store = GeneratedChunkStore(self.data_folder / "generated_chunks.json")
         self.chunk_store.load()
+        self.import_dir = self.data_folder / "import"
+        self.import_dir.mkdir(parents=True, exist_ok=True)
+        self._importers: dict[str, BedrockWorldImporter] = {}
         self._chunk_queue: deque[tuple[str, int, int]] = deque()
         self._queued_keys: set[tuple[str, int, int]] = set()
         self._tick_counter = 0
+        imported_names = self._scan_import_folder()
+        if imported_names:
+            self.logger.info(f"Auto-imported map(s) into overworld: {', '.join(imported_names)}")
         self.register_events(self)
         self.server.scheduler.run_task(self, self._process_chunk_queue, delay=1, period=1)
         self.server.scheduler.run_task(self, self._sync_native_dimensions, delay=1)
         self.logger.info(f"Loaded {len(self.registry.worlds)} world(s) from {self.registry.storage_path}")
+
+    def _get_importer(self, world: VirtualWorld) -> BedrockWorldImporter | None:
+        source_name = world.import_source or world.name
+        if source_name in self._importers:
+            return self._importers[source_name]
+        folder = self.import_dir / source_name
+        if not folder.is_dir():
+            return None
+        resolved = resolve_import_world_dir(folder)
+        if resolved is None:
+            return None
+        imp = BedrockWorldImporter(resolved)
+        self._importers[source_name] = imp
+        return imp
+
+    def _scan_import_folder(self) -> list[str]:
+        """Scan `plugins/eldia_worlds/import/` and register any new Bedrock maps into `overworld`."""
+        if not self.import_dir.is_dir():
+            return []
+        added: list[str] = []
+        for entry in sorted(self.import_dir.iterdir()):
+            if not entry.is_dir():
+                continue
+            world_dir = resolve_import_world_dir(entry)
+            if world_dir is None:
+                continue
+            key = normalize_world_name(entry.name)
+            if not key or self.registry.get(key) is not None:
+                continue
+            try:
+                sx, sy, sz = read_level_dat_spawn(world_dir)
+                importer = BedrockWorldImporter(world_dir)
+                bounds = importer.get_chunk_bounds()
+                radius = DEFAULT_BORDER_RADIUS
+                if bounds is not None:
+                    min_cx, max_cx, min_cz, max_cz = bounds
+                    max_block = max(
+                        abs(min_cx * 16),
+                        abs(max_cx * 16 + 15),
+                        abs(min_cz * 16),
+                        abs(max_cz * 16 + 15),
+                    )
+                    radius = min(45_000, max(DEFAULT_BORDER_RADIUS, max_block + 64))
+                vw = self.registry.create(
+                    name=key,
+                    world_type="imported",
+                    dimension="overworld",
+                    border_radius=radius,
+                    use_custom_dimension=False,
+                    import_source=entry.name,
+                )
+                vw.spawn_x = float(vw.center_x) + sx
+                vw.spawn_y = sy
+                vw.spawn_z = float(vw.center_z) + sz
+                self.registry.save()
+                self._importers[entry.name] = importer
+                added.append(vw.name)
+            except (ValueError, OSError) as exc:
+                self.logger.warning(f"Failed to import '{entry.name}': {exc}")
+        return added
 
     def _has_native_plugin(self) -> bool:
         return self.server.plugin_manager.get_plugin("eldia_worlds_native") is not None
@@ -290,7 +363,12 @@ class WorldsPlugin(Plugin):
             dim = self._resolve_dimension(world.dimension)
             if dim is None:
                 continue
-            apply_chunk_template(self.server, dim, world, chunk_x, chunk_z)
+            if world.world_type == "imported":
+                importer = self._get_importer(world)
+                if importer is not None:
+                    apply_imported_chunk(self.server, dim, world, chunk_x, chunk_z, importer)
+            else:
+                apply_chunk_template(self.server, dim, world, chunk_x, chunk_z)
             self.chunk_store.mark_generated(world_name, chunk_x, chunk_z)
             processed += 1
 
@@ -563,6 +641,20 @@ class WorldsPlugin(Plugin):
             return self._handle_tp(sender, args)
         if sub == "create":
             return self._handle_create(sender, args)
+        if sub == "import":
+            if not self._require_perm(sender, "eldia_worlds.command.admin"):
+                return True
+            added = self._scan_import_folder()
+            if added:
+                sender.send_message(
+                    f"{ColorFormat.GREEN}Imported map(s) into overworld: {', '.join(added)}. "
+                    f"Use /world tp <name> to teleport."
+                )
+            else:
+                sender.send_message(
+                    f"{ColorFormat.YELLOW}No new Bedrock maps found in {self.import_dir}."
+                )
+            return True
         if sub == "setspawn":
             return self._handle_setspawn(sender, args)
         if sub == "setborder":

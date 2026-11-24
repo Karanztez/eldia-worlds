@@ -33,6 +33,7 @@ Create and manage **real Custom Dimensions (`type=999`)** and isolated worlds in
 | `/world info <name>` | View world details and spawn coordinates | `eldia_worlds.command.world` |
 | `/world tp <name> [player]` | Teleport to a world | `eldia_worlds.command.tp` |
 | `/world create <name> [void\|flat\|normal] [dimension] [radius]` | Create a new dimension and teleport there | `eldia_worlds.command.admin` |
+| `/world import` | Auto-import Bedrock maps placed in `plugins/eldia_worlds/import/` into `overworld` | `eldia_worlds.command.admin` |
 | `/world setspawn [name]` | Set a world's spawn to your position | `eldia_worlds.command.admin` |
 | `/world setborder <name> <radius>` | Set border radius (`0` = unlimited) | `eldia_worlds.command.admin` |
 | `/world setgamemode <name> <mode\|none>` | Set per-world GameMode | `eldia_worlds.command.admin` |

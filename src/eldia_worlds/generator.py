@@ -8,6 +8,8 @@ if TYPE_CHECKING:
     from endstone import Server
     from endstone.level import Dimension
 
+    from .importer import BedrockWorldImporter
+
 from .storage import VirtualWorld
 
 _DIMENSION_HEIGHT_RANGES: dict[str, tuple[int, int]] = {
@@ -112,3 +114,58 @@ def resolve_safe_spawn_y(dimension: Dimension, world: VirtualWorld) -> float:
     if top_y > -64:
         return float(top_y + 1)
     return world.spawn_y
+
+
+def apply_imported_chunk(
+    server: Server,
+    dimension: Dimension,
+    world: VirtualWorld,
+    chunk_x: int,
+    chunk_z: int,
+    importer: BedrockWorldImporter,
+) -> None:
+    """Clear a chunk in `overworld` and paste blocks from an imported Bedrock world."""
+    x1 = chunk_x * 16
+    z1 = chunk_z * 16
+    x2 = x1 + 15
+    z2 = z1 + 15
+    min_y, max_y = _DIMENSION_HEIGHT_RANGES.get(world.dimension, (-64, 319))
+
+    src_cx = chunk_x - (world.center_x // 16)
+    src_cz = chunk_z - (world.center_z // 16)
+    blocks = importer.read_chunk_blocks(src_cx, src_cz)
+    if not blocks:
+        return
+
+    y = min_y
+    while y <= max_y:
+        top = min(y + 127, max_y)
+        _fill(server, world.dimension, x1, y, z1, x2, top, z2, "air")
+        y = top + 1
+
+    data_cache: dict[tuple[str, tuple[tuple[str, object], ...]], object | None] = {}
+    create_bd = getattr(server, "create_block_data", None)
+
+    for lx, by, lz, bname, states in blocks:
+        if by < min_y or by > max_y:
+            continue
+        blk = dimension.get_block_at(x1 + lx, by, z1 + lz)
+        if states and callable(create_bd):
+            cache_key = (bname, tuple(sorted(states.items())))
+            if cache_key not in data_cache:
+                try:
+                    data_cache[cache_key] = create_bd(bname, states)
+                except Exception as exc:  # noqa: BLE001
+                    _ = exc
+                    data_cache[cache_key] = None
+            bd = data_cache[cache_key]
+            if bd is not None:
+                try:
+                    blk.set_data(bd, apply_physics=False)
+                    continue
+                except Exception as exc:  # noqa: BLE001
+                    _ = exc
+        try:
+            blk.set_type(bname, apply_physics=False)
+        except Exception as exc:  # noqa: BLE001
+            _ = exc

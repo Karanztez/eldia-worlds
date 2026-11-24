@@ -8,10 +8,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Literal
 
-WorldType = Literal["void", "flat", "normal"]
+WorldType = Literal["void", "flat", "normal", "imported"]
 DimensionKey = Literal["overworld", "nether", "the_end"]
 
-VALID_WORLD_TYPES: tuple[str, ...] = ("void", "flat", "normal")
+VALID_WORLD_TYPES: tuple[str, ...] = ("void", "flat", "normal", "imported")
 VALID_DIMENSIONS: tuple[str, ...] = ("overworld", "nether", "the_end")
 VALID_GAMEMODES: tuple[str, ...] = ("survival", "creative", "adventure", "spectator")
 
@@ -49,6 +49,7 @@ class VirtualWorld:
     generated: bool = False
     builtin: bool = False
     custom_dimension: bool = False
+    import_source: str | None = None
 
     def contains(self, dimension_name: str, x: float, z: float) -> bool:
         """Check whether (dimension_name, x, z) falls inside this world's border."""
@@ -198,6 +199,7 @@ class WorldRegistry:
         border_radius: int = DEFAULT_BORDER_RADIUS,
         gamemode: str | None = None,
         use_custom_dimension: bool = False,
+        import_source: str | None = None,
     ) -> VirtualWorld:
         """Create and persist a new virtual or native custom-dimension world."""
         key = normalize_world_name(name)
@@ -239,9 +241,10 @@ class WorldRegistry:
             spawn_z=float(center_z) + 0.5,
             border_radius=border_radius,
             gamemode=gamemode,
-            generated=(world_type == "normal" and not use_custom_dimension),
+            generated=(world_type in ("normal", "imported") and not use_custom_dimension),
             builtin=False,
             custom_dimension=use_custom_dimension,
+            import_source=import_source,
         )
         self.worlds[key] = world
         self.save()
@@ -294,12 +297,12 @@ class WorldRegistry:
     def find_world_for_chunk(
         self, dimension_name: str, chunk_x: int, chunk_z: int
     ) -> VirtualWorld | None:
-        """Find a custom void/flat fallback world whose zone overlaps the given chunk."""
+        """Find a custom void/flat/imported world whose zone overlaps the given chunk."""
         for world in self.worlds.values():
             if (
                 not world.builtin
                 and not world.custom_dimension
-                and world.world_type in ("void", "flat")
+                and world.world_type in ("void", "flat", "imported")
                 and world.chunk_overlaps(dimension_name, chunk_x, chunk_z)
             ):
                 return world
