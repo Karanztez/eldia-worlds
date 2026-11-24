@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
+from types import MethodType, SimpleNamespace
 
 import pytest
 
 from eldia_worlds import WorldsAPI, get_worlds_api
 from eldia_worlds.importer import decode_subchunk_blocks
+from eldia_worlds.plugin import WorldsPlugin
 from eldia_worlds.storage import DEFAULT_SPACING, GeneratedChunkStore, WorldRegistry
 
 
@@ -159,3 +162,135 @@ def test_imported_world_registration_and_subchunk_decoder(tmp_path: Path) -> Non
     # Imported worlds must never be treated as native custom dimensions
     assert imported.custom_dimension is False
     assert imported.import_source is not None
+
+
+def _make_dummy_plugin(tmp_path: Path, registry: WorldRegistry) -> SimpleNamespace:
+    store = GeneratedChunkStore(tmp_path / "chunks.json")
+    store.load()
+    warnings: list[str] = []
+    infos: list[str] = []
+    logger = SimpleNamespace(
+        warning=warnings.append,
+        info=infos.append,
+        debug=lambda _m: None,
+    )
+    plugin = SimpleNamespace(
+        registry=registry,
+        chunk_store=store,
+        import_dir=tmp_path / "import",
+        logger=logger,
+        _importers={},
+        _chunk_queue=deque(),
+        _queued_keys=set(),
+        _chunk_retries={},
+        _warned_missing_importers=set(),
+        _logged_imported_chunks=0,
+        _tick_counter=0,
+        server=SimpleNamespace(),
+        _warnings=warnings,
+        _infos=infos,
+    )
+    plugin._defer_chunk = MethodType(WorldsPlugin._defer_chunk, plugin)
+    plugin._get_importer = MethodType(WorldsPlugin._get_importer, plugin)
+    plugin._enqueue_chunk = MethodType(WorldsPlugin._enqueue_chunk, plugin)
+    return plugin
+
+
+def test_on_player_move_skips_cross_dimension_and_teleports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        "eldia_worlds.plugin.Location",
+        lambda dim, x, y, z, pitch, yaw: SimpleNamespace(
+            dimension=dim, x=x, y=y, z=z, pitch=pitch, yaw=yaw
+        ),
+    )
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    loy = registry.create("loykathong", world_type="void", use_custom_dimension=True, border_radius=2000)
+    thailand = registry.create("thailand", world_type="imported", dimension="overworld", border_radius=1200)
+    assert loy.dimension == "loykathong"
+    assert thailand.center_x == DEFAULT_SPACING
+
+    plugin = _make_dummy_plugin(tmp_path, registry)
+    tips: list[str] = []
+    player = SimpleNamespace(send_tip=tips.append)
+
+    dim_loy = SimpleNamespace(name="loykathong")
+    dim_overworld = SimpleNamespace(name="Overworld")
+
+    # 1. Cross-dimension teleport (loykathong edge -> overworld) must NOT clamp back to loykathong
+    cross_to = SimpleNamespace(dimension=dim_overworld, x=0.5, y=64.0, z=0.5, pitch=0.0, yaw=0.0)
+    cross_event = SimpleNamespace(
+        from_location=SimpleNamespace(
+            dimension=dim_loy, x=1998.0, y=65.0, z=101.0, pitch=0.0, yaw=0.0
+        ),
+        to_location=cross_to,
+        player=player,
+    )
+    WorldsPlugin.on_player_move(plugin, cross_event)
+    assert cross_event.to_location is cross_to
+    assert tips == []
+
+    # 2. Same-dimension long-distance teleport (thailand -> overworld spawn) must NOT clamp
+    far_to = SimpleNamespace(dimension=dim_overworld, x=0.5, y=70.0, z=0.5, pitch=0.0, yaw=0.0)
+    far_event = SimpleNamespace(
+        from_location=SimpleNamespace(
+            dimension=dim_overworld,
+            x=float(thailand.center_x),
+            y=65.0,
+            z=float(thailand.center_z),
+            pitch=0.0,
+            yaw=0.0,
+        ),
+        to_location=far_to,
+        player=player,
+    )
+    WorldsPlugin.on_player_move(plugin, far_event)
+    assert far_event.to_location is far_to
+    assert tips == []
+
+    # 3. Short step across border MUST clamp inside border
+    edge_event = SimpleNamespace(
+        from_location=SimpleNamespace(
+            dimension=dim_loy, x=1999.0, y=65.0, z=100.0, pitch=0.0, yaw=0.0
+        ),
+        to_location=SimpleNamespace(
+            dimension=dim_loy, x=2002.0, y=65.0, z=100.0, pitch=0.0, yaw=0.0
+        ),
+        player=player,
+    )
+    WorldsPlugin.on_player_move(plugin, edge_event)
+    assert edge_event.to_location.x <= 1998.5
+    assert len(tips) == 1
+
+
+def test_process_chunk_queue_retries_unloaded_and_skips_missing_importer(tmp_path: Path) -> None:
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    thailand = registry.create(
+        "thailand",
+        world_type="imported",
+        dimension="overworld",
+        border_radius=1200,
+        import_source="thailand",
+    )
+    plugin = _make_dummy_plugin(tmp_path, registry)
+    loaded_chunks: list[SimpleNamespace] = []
+    plugin._resolve_dimension = lambda _key: SimpleNamespace(loaded_chunks=loaded_chunks)
+
+    cx = thailand.center_x // 16
+    cz = thailand.center_z // 16
+    plugin._enqueue_chunk(thailand, cx, cz)
+
+    # Tick 1: chunk is not in loaded_chunks yet -> must be deferred (not dropped or marked generated)
+    WorldsPlugin._process_chunk_queue(plugin)
+    assert ("thailand", cx, cz) in plugin._queued_keys
+    assert len(plugin._chunk_queue) == 1
+    assert not plugin.chunk_store.is_generated("thailand", cx, cz)
+
+    # Tick 2: chunk loads, but import folder doesn't exist -> must warn and NOT mark generated
+    loaded_chunks.append(SimpleNamespace(x=cx, z=cz))
+    WorldsPlugin._process_chunk_queue(plugin)
+    assert not plugin.chunk_store.is_generated("thailand", cx, cz)
+    assert len(plugin._warnings) == 1

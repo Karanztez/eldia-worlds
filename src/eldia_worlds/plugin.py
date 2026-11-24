@@ -101,16 +101,19 @@ class WorldsPlugin(Plugin):
         self._importers: dict[str, BedrockWorldImporter] = {}
         self._chunk_queue: deque[tuple[str, int, int]] = deque()
         self._queued_keys: set[tuple[str, int, int]] = set()
+        self._chunk_retries: dict[tuple[str, int, int], int] = {}
+        self._warned_missing_importers: set[str] = set()
+        self._logged_imported_chunks = 0
         self._tick_counter = 0
         imported_names = self._scan_import_folder()
         if imported_names:
             self.logger.info(f"Auto-imported map(s) into overworld: {', '.join(imported_names)}")
-        # Reset stale chunk_store marks from pre-0.2.5 imported worlds once
+        # Reset stale chunk_store marks from pre-0.2.6 imported worlds once
         healed = False
         for w in self.registry.list_worlds():
-            if w.world_type == "imported" and w.import_version < 2:
+            if w.world_type == "imported" and w.import_version < 3:
                 self.chunk_store.remove_world(w.name)
-                w.import_version = 2
+                w.import_version = 3
                 healed = True
         if healed:
             self.chunk_store.save()
@@ -269,13 +272,13 @@ class WorldsPlugin(Plugin):
         )
 
     def _enqueue_imported_spawn_chunks(self, world: VirtualWorld) -> None:
-        """Enqueue the 3x3 chunk area around an imported world's spawn once loaded."""
+        """Enqueue the 5x5 chunk area around an imported world's spawn once loaded."""
         if world.world_type != "imported":
             return
         scx = int(world.spawn_x // 16)
         scz = int(world.spawn_z // 16)
-        for dx in range(-1, 2):
-            for dz in range(-1, 2):
+        for dx in range(-2, 3):
+            for dz in range(-2, 3):
                 self._enqueue_chunk(world, scx + dx, scz + dz)
 
     def _teleport_player(self, player: Player, world: VirtualWorld) -> bool:
@@ -398,14 +401,27 @@ class WorldsPlugin(Plugin):
         self._queued_keys.add(key)
         self._chunk_queue.append(key)
 
+    def _defer_chunk(self, key: tuple[str, int, int], reason: str) -> bool:
+        """Re-queue an unloaded or not-yet-writable chunk up to 40 attempts before giving up."""
+        retries = self._chunk_retries.get(key, 0) + 1
+        if retries <= 40:
+            self._chunk_retries[key] = retries
+            return True
+        self._chunk_retries.pop(key, None)
+        self.logger.warning(f"Dropped chunk {key} after 40 retries ({reason}).")
+        return False
+
     def _process_chunk_queue(self) -> None:
         processed = 0
         loaded_by_dim: dict[str, set[tuple[int, int]]] = {}
+        deferred: list[tuple[str, int, int]] = []
         while self._chunk_queue and processed < 4:
-            world_name, chunk_x, chunk_z = self._chunk_queue.popleft()
-            self._queued_keys.discard((world_name, chunk_x, chunk_z))
+            key = self._chunk_queue.popleft()
+            world_name, chunk_x, chunk_z = key
+            self._queued_keys.discard(key)
             world = self.registry.get(world_name)
             if world is None or self.chunk_store.is_generated(world_name, chunk_x, chunk_z):
+                self._chunk_retries.pop(key, None)
                 continue
             dim = self._resolve_dimension(world.dimension)
             if dim is None:
@@ -414,21 +430,53 @@ class WorldsPlugin(Plugin):
             if dim_key not in loaded_by_dim:
                 loaded_by_dim[dim_key] = {(c.x, c.z) for c in dim.loaded_chunks}
             if (chunk_x, chunk_z) not in loaded_by_dim[dim_key]:
+                if self._defer_chunk(key, "chunk not in loaded_chunks"):
+                    deferred.append(key)
                 continue
             if world.world_type == "imported":
                 importer = self._get_importer(world)
-                if importer is not None:
-                    ok = apply_imported_chunk(self.server, dim, world, chunk_x, chunk_z, importer)
-                    if not ok:
-                        continue
-                    self.chunk_store.mark_generated(world_name, chunk_x, chunk_z)
-                    # Imported chunks can have 10k+ blocks; limit to 1 per tick for smooth TPS
-                    processed = 4
+                if importer is None:
+                    self._chunk_retries.pop(key, None)
+                    if world.name not in self._warned_missing_importers:
+                        self._warned_missing_importers.add(world.name)
+                        self.logger.warning(
+                            f"Importer not found for '{world.name}' "
+                            f"(import_source={world.import_source}, dir={self.import_dir})"
+                        )
                     continue
-            else:
-                apply_chunk_template(self.server, dim, world, chunk_x, chunk_z)
+                ok = apply_imported_chunk(
+                    self.server,
+                    dim,
+                    world,
+                    chunk_x,
+                    chunk_z,
+                    importer,
+                    logger=self.logger,
+                )
+                if not ok:
+                    if self._defer_chunk(key, "chunk not writable"):
+                        deferred.append(key)
+                    continue
+                self._chunk_retries.pop(key, None)
+                self.chunk_store.mark_generated(world_name, chunk_x, chunk_z)
+                self._logged_imported_chunks += 1
+                if self._logged_imported_chunks <= 5 or self._logged_imported_chunks % 25 == 0:
+                    self.logger.info(
+                        f"Applied imported chunk ({chunk_x}, {chunk_z}) for '{world.name}' "
+                        f"(total applied this session: {self._logged_imported_chunks})"
+                    )
+                # Imported chunks can have 10k+ blocks; limit to 1 per tick for smooth TPS
+                processed = 4
+                continue
+            apply_chunk_template(self.server, dim, world, chunk_x, chunk_z)
+            self._chunk_retries.pop(key, None)
             self.chunk_store.mark_generated(world_name, chunk_x, chunk_z)
             processed += 1
+
+        for key in deferred:
+            if key not in self._queued_keys:
+                self._queued_keys.add(key)
+                self._chunk_queue.append(key)
 
         self._tick_counter += 1
         if self._tick_counter % 100 == 0:
@@ -448,12 +496,18 @@ class WorldsPlugin(Plugin):
         from_loc = event.from_location
         if to_loc is None or from_loc is None:
             return
-        dim_name = from_loc.dimension.name.lower()
+        from_dim = from_loc.dimension.name.lower()
+        to_dim = to_loc.dimension.name.lower()
+        # Never clamp cross-dimension teleports or long-distance teleports (/warp, /world tp).
+        if from_dim != to_dim:
+            return
+        if abs(to_loc.x - from_loc.x) > 32.0 or abs(to_loc.z - from_loc.z) > 32.0:
+            return
         # Check if the player is currently inside a bordered custom world.
-        current_world = self.registry.find_world_at(dim_name, from_loc.x, from_loc.z)
+        current_world = self.registry.find_world_at(from_dim, from_loc.x, from_loc.z)
         if current_world is None or current_world.border_radius <= 0:
             return
-        if not current_world.contains(to_loc.dimension.name.lower(), to_loc.x, to_loc.z):
+        if not current_world.contains(to_dim, to_loc.x, to_loc.z):
             clamped_x, clamped_z = current_world.clamp_coordinates(to_loc.x, to_loc.z)
             safe_loc = Location(
                 from_loc.dimension,
@@ -729,19 +783,6 @@ class WorldsPlugin(Plugin):
             sender.send_message(
                 f"{ColorFormat.GREEN}Cleared chunk cache for '{target_world.name}'. Rebuilding chunks..."
             )
-            return True
-            if not self._require_perm(sender, "eldia_worlds.command.admin"):
-                return True
-            added = self._scan_import_folder()
-            if added:
-                sender.send_message(
-                    f"{ColorFormat.GREEN}Imported map(s) into overworld: {', '.join(added)}. "
-                    f"Use /world tp <name> to teleport."
-                )
-            else:
-                sender.send_message(
-                    f"{ColorFormat.YELLOW}No new Bedrock maps found in {self.import_dir}."
-                )
             return True
         if sub == "setspawn":
             return self._handle_setspawn(sender, args)

@@ -123,6 +123,7 @@ def apply_imported_chunk(
     chunk_x: int,
     chunk_z: int,
     importer: BedrockWorldImporter,
+    logger: object | None = None,
 ) -> bool:
     """Clear a chunk in `overworld` and paste blocks from an imported Bedrock world.
 
@@ -146,7 +147,8 @@ def apply_imported_chunk(
         probe = dimension.get_block_at(x1, 64, z1)
         probe.set_type(probe.type, apply_physics=False)
     except Exception as exc:  # noqa: BLE001
-        _ = exc
+        if logger is not None and hasattr(logger, "debug"):
+            logger.debug(f"Chunk ({chunk_x}, {chunk_z}) for '{world.name}' not writable yet: {exc}")
         return False
 
     y = min_y
