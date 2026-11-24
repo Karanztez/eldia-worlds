@@ -155,3 +155,7 @@ def test_imported_world_registration_and_subchunk_decoder(tmp_path: Path) -> Non
     assert len(blocks) == 4096
     assert blocks[0][1] == 64
     assert blocks[0][3] == "minecraft:stone"
+
+    # Imported worlds must never be treated as native custom dimensions
+    assert imported.custom_dimension is False
+    assert imported.import_source is not None

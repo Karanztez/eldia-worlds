@@ -135,7 +135,25 @@ class WorldsPlugin(Plugin):
             if world_dir is None:
                 continue
             key = normalize_world_name(entry.name)
-            if not key or self.registry.get(key) is not None:
+            if not key:
+                continue
+            existing = self.registry.get(key)
+            if existing is not None:
+                if existing.world_type == "imported" and existing.custom_dimension:
+                    cx, cz = self.registry._next_center("overworld")
+                    sx, sy, sz = read_level_dat_spawn(world_dir)
+                    existing.dimension = "overworld"
+                    existing.custom_dimension = False
+                    existing.center_x = cx
+                    existing.center_z = cz
+                    existing.spawn_x = float(cx) + sx
+                    existing.spawn_y = sy
+                    existing.spawn_z = float(cz) + sz
+                    existing.generated = True
+                    self.registry.save()
+                    self.logger.info(
+                        f"Restored imported world '{existing.name}' to overworld at ({cx}, {cz})"
+                    )
                 continue
             try:
                 sx, sy, sz = read_level_dat_spawn(world_dir)
@@ -186,7 +204,7 @@ class WorldsPlugin(Plugin):
             return
         changed = False
         for world in self.registry.list_worlds():
-            if world.builtin:
+            if world.builtin or world.world_type == "imported" or world.import_source:
                 continue
             if not world.custom_dimension and (abs(world.center_x) >= 100_000 or abs(world.center_z) >= 100_000):
                 # Upgrade legacy far-coordinate worlds to true native CustomDimensions
@@ -239,7 +257,31 @@ class WorldsPlugin(Plugin):
             world.spawn_yaw,
         )
 
+    def _ensure_imported_spawn_chunks(self, world: VirtualWorld) -> None:
+        """Synchronously materialize the 3x3 chunk area around an imported world's spawn."""
+        if world.world_type != "imported":
+            return
+        dim = self._resolve_dimension(world.dimension)
+        importer = self._get_importer(world)
+        if dim is None or importer is None:
+            return
+        scx = int(world.spawn_x // 16)
+        scz = int(world.spawn_z // 16)
+        changed = False
+        for dx in range(-1, 2):
+            for dz in range(-1, 2):
+                cx, cz = scx + dx, scz + dz
+                if self.chunk_store.is_generated(world.name, cx, cz):
+                    continue
+                apply_imported_chunk(self.server, dim, world, cx, cz, importer)
+                self.chunk_store.mark_generated(world.name, cx, cz)
+                changed = True
+        if changed:
+            self.chunk_store.save()
+
     def _teleport_player(self, player: Player, world: VirtualWorld) -> bool:
+        if world.world_type == "imported":
+            self._ensure_imported_spawn_chunks(world)
         loc = self._world_location(world)
         if loc is None:
             player.send_message(f"{ColorFormat.RED}Base dimension '{world.dimension}' is not available.")
