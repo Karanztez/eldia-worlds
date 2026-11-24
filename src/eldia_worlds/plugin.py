@@ -104,6 +104,14 @@ class WorldsPlugin(Plugin):
         imported_names = self._scan_import_folder()
         if imported_names:
             self.logger.info(f"Auto-imported map(s) into overworld: {', '.join(imported_names)}")
+        # Heal any imported world where v0.2.3 marked <= 12 spawn chunks before they were loaded
+        healed = False
+        for w in self.registry.list_worlds():
+            if w.world_type == "imported" and 0 < len(self.chunk_store.chunks.get(w.name, ())) <= 12:
+                self.chunk_store.remove_world(w.name)
+                healed = True
+        if healed:
+            self.chunk_store.save()
         self.register_events(self)
         self.server.scheduler.run_task(self, self._process_chunk_queue, delay=1, period=1)
         self.server.scheduler.run_task(self, self._sync_native_dimensions, delay=1)
@@ -257,31 +265,17 @@ class WorldsPlugin(Plugin):
             world.spawn_yaw,
         )
 
-    def _ensure_imported_spawn_chunks(self, world: VirtualWorld) -> None:
-        """Synchronously materialize the 3x3 chunk area around an imported world's spawn."""
+    def _enqueue_imported_spawn_chunks(self, world: VirtualWorld) -> None:
+        """Enqueue the 3x3 chunk area around an imported world's spawn once loaded."""
         if world.world_type != "imported":
-            return
-        dim = self._resolve_dimension(world.dimension)
-        importer = self._get_importer(world)
-        if dim is None or importer is None:
             return
         scx = int(world.spawn_x // 16)
         scz = int(world.spawn_z // 16)
-        changed = False
         for dx in range(-1, 2):
             for dz in range(-1, 2):
-                cx, cz = scx + dx, scz + dz
-                if self.chunk_store.is_generated(world.name, cx, cz):
-                    continue
-                apply_imported_chunk(self.server, dim, world, cx, cz, importer)
-                self.chunk_store.mark_generated(world.name, cx, cz)
-                changed = True
-        if changed:
-            self.chunk_store.save()
+                self._enqueue_chunk(world, scx + dx, scz + dz)
 
     def _teleport_player(self, player: Player, world: VirtualWorld) -> bool:
-        if world.world_type == "imported":
-            self._ensure_imported_spawn_chunks(world)
         loc = self._world_location(world)
         if loc is None:
             player.send_message(f"{ColorFormat.RED}Base dimension '{world.dimension}' is not available.")
@@ -290,6 +284,13 @@ class WorldsPlugin(Plugin):
         if not player.teleport(loc):
             player.send_message(f"{ColorFormat.RED}Teleport to '{world.name}' was cancelled.")
             return False
+
+        if world.world_type == "imported":
+            self.server.scheduler.run_task(
+                self,
+                lambda w=world: self._enqueue_imported_spawn_chunks(w),
+                delay=5,
+            )
 
         if world.gamemode and world.gamemode in _GAMEMODE_MAP:
             player.game_mode = _GAMEMODE_MAP[world.gamemode]
@@ -396,6 +397,7 @@ class WorldsPlugin(Plugin):
 
     def _process_chunk_queue(self) -> None:
         processed = 0
+        loaded_by_dim: dict[str, set[tuple[int, int]]] = {}
         while self._chunk_queue and processed < 4:
             world_name, chunk_x, chunk_z = self._chunk_queue.popleft()
             self._queued_keys.discard((world_name, chunk_x, chunk_z))
@@ -404,6 +406,11 @@ class WorldsPlugin(Plugin):
                 continue
             dim = self._resolve_dimension(world.dimension)
             if dim is None:
+                continue
+            dim_key = world.dimension.lower()
+            if dim_key not in loaded_by_dim:
+                loaded_by_dim[dim_key] = {(c.x, c.z) for c in dim.loaded_chunks}
+            if (chunk_x, chunk_z) not in loaded_by_dim[dim_key]:
                 continue
             if world.world_type == "imported":
                 importer = self._get_importer(world)
