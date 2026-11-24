@@ -65,6 +65,7 @@ class WorldsPlugin(Plugin):
                 "/world info <name: str>",
                 "/world tp <name: str> [player: player]",
                 "/world create <name: str> [world_type: str] [dimension: str] [radius: int]",
+                "/world load <name: str> [radius: int]",
                 "/world import",
                 "/world reimport <name: str>",
                 "/world setspawn [name: str]",
@@ -105,6 +106,7 @@ class WorldsPlugin(Plugin):
         self._chunk_queue: deque[tuple[str, int, int]] = deque()
         self._queued_keys: set[tuple[str, int, int]] = set()
         self._chunk_retries: dict[tuple[str, int, int], int] = {}
+        self._active_loads: dict[str, dict[str, Any]] = {}
         self._warned_missing_importers: set[str] = set()
         self._logged_imported_chunks = 0
         self._tick_counter = 0
@@ -243,6 +245,12 @@ class WorldsPlugin(Plugin):
             self.registry.save()
 
     def on_disable(self) -> None:
+        for job in list(self._active_loads.values()):
+            self.server.dispatch_command(
+                self.server.command_sender,
+                f"execute in {job['world'].dimension} run tickingarea remove {job['ta_name']}",
+            )
+        self._active_loads.clear()
         WorldsAPI.set_instance(None)
         self.chunk_store.save()
 
@@ -330,6 +338,16 @@ class WorldsPlugin(Plugin):
 
             self.server.scheduler.run_task(self, _finalize_spawn, delay=10)
 
+        if world.name in self._active_loads:
+            job = self._active_loads[world.name]
+            done = sum(1 for cx, cz in job["chunks"] if self.chunk_store.is_generated(world.name, cx, cz))
+            remaining = max(0, job["total"] - done)
+            if remaining > 0:
+                player.send_message(
+                    f"{ColorFormat.YELLOW}World '{world.name}' still pre-loading "
+                    f"({remaining}/{job['total']} chunks remaining)..."
+                )
+
         player.send_message(
             f"{ColorFormat.GREEN}Teleported to world '{world.name}' "
             f"({world.dimension}, {world.world_type})."
@@ -403,6 +421,13 @@ class WorldsPlugin(Plugin):
         )
         player.send_form(form)
 
+    def _is_in_active_load(self, dim_key: str, chunk_x: int, chunk_z: int) -> bool:
+        """Return True if a chunk belongs to an active `/world load` tickingarea job."""
+        for job in self._active_loads.values():
+            if job["dim_key"] == dim_key and (chunk_x, chunk_z) in job["chunk_set"]:
+                return True
+        return False
+
     def _is_within_player_tick_radius(
         self,
         dim_key: str,
@@ -410,7 +435,9 @@ class WorldsPlugin(Plugin):
         chunk_z: int,
         radius: int = TICK_BUILD_RADIUS,
     ) -> bool:
-        """Return True if any online player in `dim_key` is within `radius` chunks."""
+        """Return True if a chunk is inside an active load job or near an online player."""
+        if self._is_in_active_load(dim_key, chunk_x, chunk_z):
+            return True
         for player in getattr(self.server, "online_players", ()):
             loc = getattr(player, "location", None)
             if loc is None or loc.dimension.name.lower() != dim_key:
@@ -536,9 +563,46 @@ class WorldsPlugin(Plugin):
                 self._queued_keys.add(key)
                 self._chunk_queue.append(key)
 
+        self._tick_active_loads()
         self._tick_counter += 1
         if self._tick_counter % 100 == 0:
             self.chunk_store.save()
+
+    def _tick_active_loads(self) -> None:
+        """Track active `/world load` jobs, re-enqueue pending chunks, and clean up tickingareas."""
+        if not self._active_loads:
+            return
+        finished: list[str] = []
+        for world_name, job in list(self._active_loads.items()):
+            job["ticks"] += 1
+            ticks = job["ticks"]
+            world = job["world"]
+            done = sum(
+                1 for cx, cz in job["chunks"] if self.chunk_store.is_generated(world_name, cx, cz)
+            )
+            total = job["total"]
+            if done >= total or ticks >= 1200:
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f"execute in {world.dimension} run tickingarea remove {job['ta_name']}",
+                )
+                self.chunk_store.save()
+                status = (
+                    f"Pre-loaded '{world.name}' ({done}/{total} chunks ready). "
+                    f"Use /world tp {world.name} to enter."
+                )
+                self.logger.info(status)
+                sender = job.get("sender")
+                if sender is not None and getattr(sender, "is_valid", True):
+                    sender.send_message(f"{ColorFormat.GREEN}{status}")
+                finished.append(world_name)
+            elif ticks % 20 == 0:
+                for cx, cz in job["chunks"]:
+                    self._enqueue_chunk(world, cx, cz)
+                if ticks % 100 == 0:
+                    self.logger.info(f"Pre-loading '{world.name}': {done}/{total} chunks...")
+        for world_name in finished:
+            self._active_loads.pop(world_name, None)
 
     @event_handler
     def on_chunk_load(self, event: ChunkLoadEvent) -> None:
@@ -788,6 +852,102 @@ class WorldsPlugin(Plugin):
         sender.send_message(f"{ColorFormat.GREEN}Deleted world '{removed.name}' from registry.")
         return True
 
+    def _handle_load(self, sender: CommandSender, args: list[str]) -> bool:
+        if not self._require_perm(sender, "eldia_worlds.command.admin"):
+            return True
+        if len(args) < 2:
+            sender.send_message(f"{ColorFormat.RED}Usage: /world load <name> [radius]")
+            return True
+        world = self.registry.get(args[1])
+        if world is None:
+            sender.send_message(f"{ColorFormat.RED}World '{args[1]}' not found.")
+            return True
+        if world.builtin or world.world_type not in ("imported", "void", "flat"):
+            sender.send_message(
+                f"{ColorFormat.RED}World '{world.name}' ({world.world_type}) does not need pre-loading."
+            )
+            return True
+        radius = TICK_BUILD_RADIUS
+        if len(args) >= 3:
+            try:
+                radius = int(args[2])
+            except ValueError:
+                sender.send_message(f"{ColorFormat.RED}Radius must be an integer (1..4).")
+                return True
+        if not 1 <= radius <= 4:
+            sender.send_message(
+                f"{ColorFormat.RED}Radius must be between 1 and 4 (max 81 chunks per tickingarea)."
+            )
+            return True
+        if world.world_type == "imported":
+            importer = self._get_importer(world)
+            if importer is None:
+                sender.send_message(
+                    f"{ColorFormat.RED}Importer source for '{world.name}' not found in {self.import_dir}."
+                )
+                return True
+            importer.ensure_indexed()
+
+        dim_key = world.dimension.lower()
+        scx = int(world.spawn_x // 16)
+        scz = int(world.spawn_z // 16)
+        offsets = sorted(
+            (
+                (dx, dz)
+                for dx in range(-radius, radius + 1)
+                for dz in range(-radius, radius + 1)
+            ),
+            key=lambda pair: pair[0] * pair[0] + pair[1] * pair[1],
+        )
+        chunks = [
+            (scx + dx, scz + dz)
+            for dx, dz in offsets
+            if world.chunk_overlaps(dim_key, scx + dx, scz + dz)
+        ]
+        if not chunks:
+            sender.send_message(f"{ColorFormat.YELLOW}No chunks overlap spawn for '{world.name}'.")
+            return True
+
+        min_cx = min(cx for cx, _ in chunks)
+        max_cx = max(cx for cx, _ in chunks)
+        min_cz = min(cz for _, cz in chunks)
+        max_cz = max(cz for _, cz in chunks)
+        ta_name = f"eldia_load_{world.name}"[:32]
+
+        self.server.dispatch_command(
+            self.server.command_sender,
+            f"execute in {world.dimension} run tickingarea remove {ta_name}",
+        )
+        self.server.dispatch_command(
+            self.server.command_sender,
+            f"execute in {world.dimension} run tickingarea add "
+            f"{min_cx * 16} 0 {min_cz * 16} {max_cx * 16 + 15} 0 {max_cz * 16 + 15} {ta_name}",
+        )
+
+        self._active_loads[world.name] = {
+            "world": world,
+            "dim_key": dim_key,
+            "chunks": chunks,
+            "chunk_set": set(chunks),
+            "total": len(chunks),
+            "ta_name": ta_name,
+            "sender": sender,
+            "ticks": 0,
+        }
+        already_done = 0
+        for cx, cz in chunks:
+            if self.chunk_store.is_generated(world.name, cx, cz):
+                already_done += 1
+            else:
+                self._enqueue_chunk(world, cx, cz)
+
+        pending = len(chunks) - already_done
+        sender.send_message(
+            f"{ColorFormat.YELLOW}Pre-loading '{world.name}' ({pending}/{len(chunks)} chunks queued, "
+            f"radius={radius}). Please wait before /world tp {world.name}."
+        )
+        return True
+
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         if command.name != "world":
             return False
@@ -811,6 +971,8 @@ class WorldsPlugin(Plugin):
             return self._handle_info(sender, args)
         if sub in ("tp", "go", "warp"):
             return self._handle_tp(sender, args)
+        if sub in ("load", "preload", "pregen"):
+            return self._handle_load(sender, args)
         if sub == "create":
             return self._handle_create(sender, args)
         if sub == "import":

@@ -191,12 +191,15 @@ def _make_dummy_plugin(tmp_path: Path, registry: WorldRegistry) -> SimpleNamespa
         _warnings=warnings,
         _infos=infos,
     )
+    plugin._active_loads = {}
     plugin._defer_chunk = MethodType(WorldsPlugin._defer_chunk, plugin)
     plugin._get_importer = MethodType(WorldsPlugin._get_importer, plugin)
     plugin._enqueue_chunk = MethodType(WorldsPlugin._enqueue_chunk, plugin)
+    plugin._is_in_active_load = MethodType(WorldsPlugin._is_in_active_load, plugin)
     plugin._is_within_player_tick_radius = MethodType(
         WorldsPlugin._is_within_player_tick_radius, plugin
     )
+    plugin._tick_active_loads = MethodType(WorldsPlugin._tick_active_loads, plugin)
     return plugin
 
 
@@ -378,3 +381,45 @@ def test_apply_imported_chunk_returns_false_when_bottom_fill_fails(tmp_path: Pat
 
     ok = apply_imported_chunk(server, dimension, thailand, cx, cz, importer)
     assert ok is False
+
+
+def test_world_load_creates_and_cleans_up_tickingarea(tmp_path: Path) -> None:
+    registry = WorldRegistry(tmp_path / "worlds.json")
+    registry.load()
+    thailand = registry.create(
+        "thailand",
+        world_type="imported",
+        dimension="overworld",
+        border_radius=1200,
+        import_source="thailand",
+    )
+    plugin = _make_dummy_plugin(tmp_path, registry)
+    dispatched: list[str] = []
+    plugin.server = SimpleNamespace(
+        online_players=[],
+        command_sender=object(),
+        dispatch_command=lambda _sender, cmd: dispatched.append(cmd) or True,
+    )
+    plugin._importers["thailand"] = SimpleNamespace(ensure_indexed=lambda: None)
+    plugin._require_perm = lambda _sender, _perm: True
+
+    messages: list[str] = []
+    sender = SimpleNamespace(send_message=messages.append, is_valid=True)
+
+    handled = WorldsPlugin._handle_load(plugin, sender, ["load", "thailand", "1"])
+    assert handled is True
+    assert any("tickingarea add" in cmd for cmd in dispatched)
+    assert "thailand" in plugin._active_loads
+    assert len(plugin._chunk_queue) == 9
+
+    scx = int(thailand.spawn_x // 16)
+    scz = int(thailand.spawn_z // 16)
+    assert plugin._is_within_player_tick_radius("overworld", scx, scz) is True
+
+    for cx, cz in plugin._active_loads["thailand"]["chunks"]:
+        plugin.chunk_store.mark_generated("thailand", cx, cz)
+
+    WorldsPlugin._tick_active_loads(plugin)
+    assert any("tickingarea remove" in cmd for cmd in dispatched)
+    assert "thailand" not in plugin._active_loads
+    assert any("Pre-loaded 'thailand' (9/9 chunks ready)" in msg for msg in messages)
