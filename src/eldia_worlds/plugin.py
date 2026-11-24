@@ -63,6 +63,7 @@ class WorldsPlugin(Plugin):
                 "/world tp <name: str> [player: player]",
                 "/world create <name: str> [world_type: str] [dimension: str] [radius: int]",
                 "/world import",
+                "/world reimport <name: str>",
                 "/world setspawn [name: str]",
                 "/world setborder <name: str> <radius: int>",
                 "/world setgamemode <name: str> <mode: str>",
@@ -104,14 +105,16 @@ class WorldsPlugin(Plugin):
         imported_names = self._scan_import_folder()
         if imported_names:
             self.logger.info(f"Auto-imported map(s) into overworld: {', '.join(imported_names)}")
-        # Heal any imported world where v0.2.3 marked <= 12 spawn chunks before they were loaded
+        # Reset stale chunk_store marks from pre-0.2.5 imported worlds once
         healed = False
         for w in self.registry.list_worlds():
-            if w.world_type == "imported" and 0 < len(self.chunk_store.chunks.get(w.name, ())) <= 12:
+            if w.world_type == "imported" and w.import_version < 2:
                 self.chunk_store.remove_world(w.name)
+                w.import_version = 2
                 healed = True
         if healed:
             self.chunk_store.save()
+            self.registry.save()
         self.register_events(self)
         self.server.scheduler.run_task(self, self._process_chunk_queue, delay=1, period=1)
         self.server.scheduler.run_task(self, self._sync_native_dimensions, delay=1)
@@ -415,7 +418,13 @@ class WorldsPlugin(Plugin):
             if world.world_type == "imported":
                 importer = self._get_importer(world)
                 if importer is not None:
-                    apply_imported_chunk(self.server, dim, world, chunk_x, chunk_z, importer)
+                    ok = apply_imported_chunk(self.server, dim, world, chunk_x, chunk_z, importer)
+                    if not ok:
+                        continue
+                    self.chunk_store.mark_generated(world_name, chunk_x, chunk_z)
+                    # Imported chunks can have 10k+ blocks; limit to 1 per tick for smooth TPS
+                    processed = 4
+                    continue
             else:
                 apply_chunk_template(self.server, dim, world, chunk_x, chunk_z)
             self.chunk_store.mark_generated(world_name, chunk_x, chunk_z)
@@ -691,6 +700,36 @@ class WorldsPlugin(Plugin):
         if sub == "create":
             return self._handle_create(sender, args)
         if sub == "import":
+            if not self._require_perm(sender, "eldia_worlds.command.admin"):
+                return True
+            added = self._scan_import_folder()
+            if added:
+                sender.send_message(
+                    f"{ColorFormat.GREEN}Imported map(s) into overworld: {', '.join(added)}. "
+                    f"Use /world tp <name> to teleport."
+                )
+            else:
+                sender.send_message(
+                    f"{ColorFormat.YELLOW}No new Bedrock maps found in {self.import_dir}."
+                )
+            return True
+        if sub == "reimport":
+            if not self._require_perm(sender, "eldia_worlds.command.admin"):
+                return True
+            if len(args) < 2:
+                sender.send_message(f"{ColorFormat.RED}Usage: /world reimport <name>")
+                return True
+            target_world = self.registry.get(args[1])
+            if target_world is None or target_world.world_type != "imported":
+                sender.send_message(f"{ColorFormat.RED}Imported world '{args[1]}' not found.")
+                return True
+            self.chunk_store.remove_world(target_world.name)
+            self.chunk_store.save()
+            self._enqueue_imported_spawn_chunks(target_world)
+            sender.send_message(
+                f"{ColorFormat.GREEN}Cleared chunk cache for '{target_world.name}'. Rebuilding chunks..."
+            )
+            return True
             if not self._require_perm(sender, "eldia_worlds.command.admin"):
                 return True
             added = self._scan_import_folder()

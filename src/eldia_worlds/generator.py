@@ -123,8 +123,12 @@ def apply_imported_chunk(
     chunk_x: int,
     chunk_z: int,
     importer: BedrockWorldImporter,
-) -> None:
-    """Clear a chunk in `overworld` and paste blocks from an imported Bedrock world."""
+) -> bool:
+    """Clear a chunk in `overworld` and paste blocks from an imported Bedrock world.
+
+    Returns True if blocks were placed (or chunk is empty in source), False if target chunk
+    is not writable yet.
+    """
     x1 = chunk_x * 16
     z1 = chunk_z * 16
     x2 = x1 + 15
@@ -135,7 +139,15 @@ def apply_imported_chunk(
     src_cz = chunk_z - (world.center_z // 16)
     blocks = importer.read_chunk_blocks(src_cx, src_cz)
     if not blocks:
-        return
+        return True
+
+    # Probe that the target chunk is actually loaded and writable in BDS before clearing/pasting
+    try:
+        probe = dimension.get_block_at(x1, 64, z1)
+        probe.set_type(probe.type, apply_physics=False)
+    except Exception as exc:  # noqa: BLE001
+        _ = exc
+        return False
 
     y = min_y
     while y <= max_y:
@@ -169,3 +181,4 @@ def apply_imported_chunk(
             blk.set_type(bname, apply_physics=False)
         except Exception as exc:  # noqa: BLE001
             _ = exc
+    return True

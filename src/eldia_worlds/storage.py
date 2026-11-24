@@ -50,6 +50,7 @@ class VirtualWorld:
     builtin: bool = False
     custom_dimension: bool = False
     import_source: str | None = None
+    import_version: int = 0
 
     def contains(self, dimension_name: str, x: float, z: float) -> bool:
         """Check whether (dimension_name, x, z) falls inside this world's border."""
